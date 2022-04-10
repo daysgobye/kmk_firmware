@@ -5,7 +5,7 @@ from supervisor import runtime, ticks_ms
 
 from storage import getmount
 
-from kmk.hid import HIDModes
+from kmk.keys import KC, make_key
 from kmk.kmktime import check_deadline
 from kmk.matrix import KeyEvent, intify_coordinate
 from kmk.modules import Module
@@ -56,6 +56,7 @@ class Split(Module):
         self._uart_interval = uart_interval
         self._debug_enabled = debug_enabled
         self.uart_header = bytearray([0xB2])  # Any non-zero byte should work
+        self.uart_header_press = bytearray([0xB3])
 
         if self.split_type == SplitType.BLE:
             try:
@@ -65,17 +66,16 @@ class Split(Module):
                 )
                 from adafruit_ble.services.nordic import UARTService
 
-                self.BLERadio = BLERadio
                 self.ProvideServicesAdvertisement = ProvideServicesAdvertisement
                 self.UARTService = UARTService
             except ImportError:
                 print('BLE Import error')
                 return  # BLE isn't supported on this platform
+            self._ble = BLERadio()
             self._ble_last_scan = ticks_ms() - 5000
             self._connection_count = 0
-            self._split_connected = False
             self._uart_connection = None
-            self._advertisment = None  # Seems to not be used anywhere
+            self._advertisment = None
             self._advertising = False
             self._psave_enable = False
 
@@ -88,17 +88,13 @@ class Split(Module):
         # Set up name for target side detection and BLE advertisment
         name = str(getmount('/').label)
         if self.split_type == SplitType.BLE:
-            if keyboard.hid_type == HIDModes.BLE:
-                self._ble = keyboard._hid_helper.ble
-            else:
-                self._ble = self.BLERadio()
-                self._ble.name = name
+            self._ble.name = name
         else:
             # Try to guess data pins if not supplied
             if not self.data_pin:
                 self.data_pin = keyboard.data_pin
 
-        # if split side was given, find target from split_side.
+        # if split side was given, find master from split_side.
         if self.split_side == SplitSide.LEFT:
             self._is_target = bool(self.split_target_left)
         elif self.split_side == SplitSide.RIGHT:
@@ -167,7 +163,7 @@ class Split(Module):
 
     def before_matrix_scan(self, keyboard):
         if self.split_type == SplitType.BLE:
-            self._check_all_connections(keyboard)
+            self._check_all_connections()
             self._receive_ble(keyboard)
         elif self.split_type == SplitType.UART:
             if self._is_target or self.data_pin2:
@@ -181,7 +177,7 @@ class Split(Module):
             if self.split_type == SplitType.UART and self._is_target:
                 pass  # explicit pass just for dev sanity...
 
-            elif self.split_type == SplitType.UART and (
+            if self.split_type == SplitType.UART and (
                 self.data_pin2 or not self._is_target
             ):
                 self._send_uart(keyboard.matrix_update)
@@ -215,39 +211,13 @@ class Split(Module):
                 self._uart_connection.connection_interval = 11.25
                 self._psave_enable = False
 
-    def _check_all_connections(self, keyboard):
+    def _check_all_connections(self):
         '''Validates the correct number of BLE connections'''
-        self._previous_connection_count = self._connection_count
         self._connection_count = len(self._ble.connections)
-        if self._is_target:
-            if self._advertising or not self._check_if_split_connected():
-                self._target_advertise()
-            elif self._connection_count < 2 and keyboard.hid_type == HIDModes.BLE:
-                keyboard._hid_helper.start_advertising()
-
+        if self._is_target and self._connection_count < 2:
+            self._target_advertise()
         elif not self._is_target and self._connection_count < 1:
             self._initiator_scan()
-
-    def _check_if_split_connected(self):
-        # I'm looking for a way how to recognize which connection is on and which one off
-        # For now, I found that service name relation to having other CP device
-        if self._connection_count == 0:
-            return False
-        if self._connection_count == 2:
-            self._split_connected = True
-            return True
-
-        # Polling this takes some time so I check only if connection_count changed
-        if self._previous_connection_count == self._connection_count:
-            return self._split_connected
-
-        bleio_connection = self._ble.connections[0]._bleio_connection
-        connection_services = bleio_connection.discover_remote_services()
-        for service in connection_services:
-            if str(service.uuid).startswith("UUID('adaf0001"):
-                self._split_connected = True
-                return True
-        return False
 
     def _initiator_scan(self):
         '''Scans for target device'''
@@ -284,21 +254,6 @@ class Split(Module):
 
     def _target_advertise(self):
         '''Advertises the target for the initiator to find'''
-        # Give previous advertising some time to complete
-        if self._advertising:
-            if self._check_if_split_connected():
-                if self._debug_enabled:
-                    print('Advertising complete')
-                self._ble.stop_advertising()
-                self._advertising = False
-                return
-
-            if not self.ble_rescan_timer():
-                return
-
-            if self._debug_enabled:
-                print('Advertising not answered')
-
         self._ble.stop_advertising()
         if self._debug_enabled:
             print('Advertising')
@@ -308,12 +263,32 @@ class Split(Module):
         advertisement = self.ProvideServicesAdvertisement(self._uart)
 
         self._ble.start_advertising(advertisement)
-        self._advertising = True
+
         self.ble_time_reset()
+        while not self.ble_rescan_timer():
+            self._connection_count = len(self._ble.connections)
+            if self._connection_count > 1:
+                self.ble_time_reset()
+                if self._debug_enabled:
+                    print('Advertising complete')
+                break
+        self._ble.stop_advertising()
+
+    def send_key_press(self, keycode):
+        if self.split_type == SplitType.UART and (
+            self.data_pin2 or not self._is_target
+        ):
+            self._send_uart_key_press(keycode)
+        elif self.split_type == SplitType.BLE:
+            pass  # Protocol needs written
+        elif self.split_type == SplitType.ONEWIRE:
+            pass  # Protocol needs written
+        else:
+            print('Unexpected case in after_matrix_scan')
 
     def ble_rescan_timer(self):
         '''If true, the rescan timer is up'''
-        return not bool(check_deadline(ticks_ms(), self._ble_last_scan, 5000))
+        return bool(check_deadline(ticks_ms(), self._ble_last_scan) > 5000)
 
     def ble_time_reset(self):
         '''Resets the rescan timer'''
@@ -325,9 +300,20 @@ class Split(Module):
         buffer[1] = update.pressed
         return buffer
 
+    def _serialize_keyCode(self, keyCode):
+        buffer = keyCode.to_bytes(2, "little")
+        return buffer
+
     def _deserialize_update(self, update):
         kevent = KeyEvent(key_number=update[0], pressed=update[1])
         return kevent
+
+    def _deserialize_keyCode(self, keycode):
+        newkeycode = int.from_bytes(keycode, "little")
+        keyobj = make_key(code=newkeycode)
+        # print("keycode")
+        # print(dir(keyobj))
+        return keyobj
 
     def _send_ble(self, update):
         if self._uart:
@@ -367,6 +353,15 @@ class Split(Module):
             self._uart.write(update)
             self._uart.write(self._checksum(update))
 
+    def _send_uart_key_press(self, keycode):
+        # Change offsets depending on where the data is going to match the correct
+        # matrix location of the receiever
+        if self._uart is not None:
+            update = self._serialize_keyCode(keycode)
+            self._uart.write(self.uart_header_press)
+            self._uart.write(update)
+            self._uart.write(self._checksum(update))
+
     def _receive_uart(self, keyboard):
         if self._uart is not None and self._uart.in_waiting > 0 or self._uart_buffer:
             if self._uart.in_waiting >= 60:
@@ -377,11 +372,18 @@ class Split(Module):
 
             while self._uart.in_waiting >= 4:
                 # Check the header
-                if self._uart.read(1) == self.uart_header:
+                header = self._uart.read(1)
+                if header == self.uart_header:
                     update = self._uart.read(2)
-
                     # check the checksum
                     if self._checksum(update) == self._uart.read(1):
                         self._uart_buffer.append(self._deserialize_update(update))
+                if header == self.uart_header_press:
+                    update = self._uart.read(2)
+                    # check the checksum
+                    if self._checksum(update) == self._uart.read(1):
+                        keycode = self._deserialize_keyCode(update)
+                        keyboard.tap_key(keycode)
+
             if self._uart_buffer:
                 keyboard.secondary_matrix_update = self._uart_buffer.pop(0)
